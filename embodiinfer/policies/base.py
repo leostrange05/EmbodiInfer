@@ -398,9 +398,44 @@ class FlowVLAPolicy(VLAPolicy):
         self, batch_size: int, generator: torch.Generator | None = None, noise_scale: float = 1.0
     ) -> torch.Tensor:
         p = next(self.parameters())
-        return noise_scale * torch.randn(
+        return noise_scale * _randn_with_cpu_npu_fallback(
             *self.flow_state_shape(batch_size),
             device=p.device,
             dtype=self.execution_dtype,
             generator=generator,
         )
+
+
+def _randn_with_cpu_npu_fallback(*size, **kwargs):
+    """Optional CPU RNG fallback for unsupported Ascend NPU RNG ops."""
+    import os
+
+    device = kwargs.get("device")
+
+    enabled = (
+        os.environ.get("EMBODIINFER_ASCEND_CPU_NOISE") == "1"
+    )
+
+    if (
+        not enabled
+        or device is None
+        or torch.device(device).type != "npu"
+    ):
+        return torch.randn(*size, **kwargs)
+
+    if kwargs.get("out") is not None:
+        raise RuntimeError(
+            "Ascend CPU RNG fallback does not support out="
+        )
+
+    generator = kwargs.get("generator")
+    if generator is not None and generator.device.type != "cpu":
+        raise RuntimeError(
+            "Ascend CPU RNG fallback requires a CPU generator"
+        )
+
+    cpu_kwargs = dict(kwargs)
+    cpu_kwargs["device"] = "cpu"
+
+    noise = torch.randn(*size, **cpu_kwargs)
+    return noise.to(device)
