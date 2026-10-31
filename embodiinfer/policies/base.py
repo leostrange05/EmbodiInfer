@@ -406,22 +406,59 @@ class FlowVLAPolicy(VLAPolicy):
         )
 
 
+def _randn_with_npu_box_muller(*size, **kwargs):
+    """Generate normal NPU noise from the supported uniform RNG path.
+
+    This is the Ascend default while the current runtime native randn operator
+    is unusable. It supports the arguments used by FlowVLAPolicy.new_noise
+    only.
+    """
+    import math
+
+    if kwargs.get("out") is not None:
+        raise RuntimeError("Ascend Box-Muller fallback does not support out=")
+
+    device = kwargs["device"]
+    generator = kwargs.get("generator")
+    if generator is not None and generator.device.type != "npu":
+        raise RuntimeError(
+            "Ascend Box-Muller fallback requires an NPU generator"
+        )
+
+    output_dtype = kwargs.get("dtype", torch.get_default_dtype())
+    if not output_dtype.is_floating_point:
+        raise TypeError("Ascend Box-Muller fallback requires a floating dtype")
+
+    u1 = torch.rand(
+        *size,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+    u2 = torch.rand(
+        *size,
+        device=device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+    normal = torch.sqrt(-2.0 * torch.log(u1.clamp_min(1e-7))) * torch.cos(
+        (2.0 * math.pi) * u2
+    )
+    return normal.to(dtype=output_dtype)
+
+
 def _randn_with_cpu_npu_fallback(*size, **kwargs):
-    """Optional CPU RNG fallback for unsupported Ascend NPU RNG ops."""
+    """Generate normal noise with a native Ascend default and CPU escape hatch."""
     import os
 
     device = kwargs.get("device")
+    is_npu = device is not None and torch.device(device).type == "npu"
 
-    enabled = (
-        os.environ.get("EMBODIINFER_ASCEND_CPU_NOISE") == "1"
-    )
-
-    if (
-        not enabled
-        or device is None
-        or torch.device(device).type != "npu"
-    ):
+    if not is_npu:
         return torch.randn(*size, **kwargs)
+
+    if os.environ.get("EMBODIINFER_ASCEND_CPU_NOISE") != "1":
+        return _randn_with_npu_box_muller(*size, **kwargs)
 
     if kwargs.get("out") is not None:
         raise RuntimeError(

@@ -43,14 +43,33 @@ class Pi05Batch:
         return self.tokens.shape[0]
 
     def to(self, device: torch.device | str, dtype: torch.dtype | None = None) -> Pi05Batch:
-        imgs = [img.to(device, non_blocking=True) for img in self.images]
+        """Move the batch with pinned asynchronous copies on Ascend by default."""
+        import os
+
+        target = torch.device(device)
+        use_pinned_npu_copy = (
+            target.type == "npu"
+            and os.environ.get("EMBODIINFER_ASCEND_SYNC_COPY") != "1"
+        )
+        non_blocking = target.type == "cuda" or use_pinned_npu_copy
+
+        def move(tensor: torch.Tensor) -> torch.Tensor:
+            if (
+                use_pinned_npu_copy
+                and tensor.device.type == "cpu"
+                and not tensor.is_pinned()
+            ):
+                tensor = tensor.pin_memory()
+            return tensor.to(target, non_blocking=non_blocking)
+
+        imgs = [move(img) for img in self.images]
         if dtype is not None:  # float images cast to model dtype; tokens/masks stay
             imgs = [img.to(dtype) for img in imgs]
         return Pi05Batch(
             images=imgs,
-            img_masks=[m.to(device, non_blocking=True) for m in self.img_masks],
-            tokens=self.tokens.to(device, non_blocking=True),
-            masks=self.masks.to(device, non_blocking=True),
+            img_masks=[move(mask) for mask in self.img_masks],
+            tokens=move(self.tokens),
+            masks=move(self.masks),
             request_ids=self.request_ids,
         )
 

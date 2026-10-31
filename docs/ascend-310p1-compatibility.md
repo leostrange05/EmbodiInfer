@@ -7,196 +7,170 @@ Architecture: Linux aarch64
 OS: Ubuntu 22.04 LTS
 
 Hardware:
+
 - NPU: Ascend 310P1
 - Device count: 1
 
 Software:
-- Python: 3.11.17
-- PyTorch: 2.7.1
-- torch_npu: 2.7.1
-- CANN Toolkit: 8.3.RC1
+
+- Python: 3.12.15
+- PyTorch: 2.9.0+cpu
+- torch_npu: 2.9.0
+- LeRobot: 0.5.1
+- Transformers: 5.3.0
+- CANN runtime and OPP: 8.5.0
 - Runtime: Docker, based on Ubuntu 22.04
 
-Development image:
-`embodiinfer/ascend-torch-dev:2.7.1-cann8.3`
-
-Development container:
-`embodiinfer-ascend-torch-dev`
+Development container: `embodiinfer-ascend-cann85`.
 
 ## 2. Verified functionality
 
-The following tests have passed:
+The following checks have passed in the environment above:
 
-- PyTorch / torch_npu initialization
-- NPU availability detection
+- PyTorch and torch_npu initialization and NPU availability
 - FP16 matrix multiplication
-- Eager attention using MatMul + Softmax
-- CPU-to-NPU random tensor transfer
-- MockFlowVLA single-request inference
-- MockFlowVLA batched inference (batch size 8)
-- CPU RNG regression
-- End-to-end inference without global monkey patches
+- Eager attention using MatMul and Softmax
+- SigLIP vision-tower eager attention during real pi0.5 inference
+- NPU uniform RNG with seed reproducibility
+- NPU Box-Muller normal-noise generation
+- Native FP32 PI0.5 sinusoidal time embedding
+- Pinned CPU-to-NPU asynchronous copies
+- Real pi0.5 checkpoint single-request inference without monkey patches
+- CPU and NPU action-output comparison with matched test inputs
 
-MockFlowVLA outputs:
+The real pi0.5 action output has shape `(50, 32)`, contains only finite
+values when checked on CPU, and passes the recorded CPU/NPU comparison
+criterion `allclose(atol=0.01, rtol=0.01)`. The comparison used the same
+checkpoint, fixed synthetic observation, action schedule, and explicit RNG
+seeds. The largest recorded action difference was 0.00163; the relative RMSE
+was 0.00366.
 
-- Single request: action chunk (50, 7)
-- Batch of 8: eight action chunks, each (50, 7)
+## 3. Compatibility behavior and limitations
 
-These results validate the synthetic MockFlowVLA execution
-path, not real pi0.5 checkpoint inference.
+### 3.1 Attention and SigLIP vision tower
 
-## 3. Known compatibility issues
+Native PyTorch SDPA fails on the tested 310P1 environment with an NPU
+operator or format compatibility error. Select `attention="eager"` for the
+EmbodiInfer attention path.
 
-### 3.1 Scaled Dot Product Attention
+When `vision_attention="eager"` is selected, PI0.5 also configures the loaded
+Hugging Face SigLIP vision tower with its public
+`set_attn_implementation("eager")` API. This is not a CPU fallback: the
+standard eager attention calculation runs on NPU using MatMul and Softmax.
+It aligns the Hugging Face submodule with the policy-level selection.
 
-Native PyTorch SDPA fails on the tested 310P1 environment
-with an NPU operator/format compatibility error.
-
-Workaround:
-
-    attention="eager"
-
-The existing EmbodiInfer EagerAttention implementation
-uses PyTorch MatMul and Softmax operations.
-
-This fallback has been verified for MockFlowVLA.
-Pi0.5 attention semantics and masks require separate tests.
+Eager attention is the verified correctness path. It can be slower than a
+working SDPA or vendor-fused implementation, so a future performance effort
+may evaluate those alternatives only after full PI0.5 semantic and numerical
+regression testing.
 
 ### 3.2 Random normal generation
 
-The following operations fail when executed directly
-on the tested NPU:
+The tested runtime fails for direct NPU normal operations:
 
     torch.randn(..., device="npu")
     torch.randn_like(npu_tensor)
 
-The failure is associated with:
+The failure is associated with `StatelessRandomNormalV2`. The supported
+NPU `torch.rand` operation is therefore transformed into standard normal
+noise with the Box-Muller formula. This is the default implementation for
+`FlowVLAPolicy.new_noise` on NPU and keeps both random-number generation and
+the transform on device.
 
-    StatelessRandomNormalV2
-
-Generating random tensors on CPU and transferring them
-to NPU succeeds.
-
-An opt-in fallback is implemented in:
-
-    embodiinfer/policies/base.py
-
-Enable it with:
+Set the following variable only to force the diagnostic or recovery CPU path:
 
     EMBODIINFER_ASCEND_CPU_NOISE=1
 
-The fallback is limited to FlowVLAPolicy.new_noise().
-It does not replace PyTorch RNG globally.
+The CPU fallback remains limited to `FlowVLAPolicy.new_noise`; it does not
+replace PyTorch RNG globally. CPU and NPU generator streams are not assumed
+to be numerically identical.
 
-CPU and NPU generator streams are not assumed to be
-numerically equivalent.
+### 3.3 PI0.5 time embedding
 
-### 3.3 IsFinite operator compilation
+The reference PI0.5 sinusoidal implementation uses a float64 reciprocal path
+that is not supported by this NPU runtime. PI0.5 therefore computes an
+algebraically equivalent FP32 formulation on NPU by default. The tested
+embedding difference against the CPU float64 reference was at most
+0.000432.
 
-An isolated NPU torch.isfinite() test failed during
-online compilation due to a missing C standard header:
+Set the following variable only to force the CPU reference implementation:
 
-    fatal error: 'stdio.h' file not found
+    EMBODIINFER_ASCEND_CPU_TIME_EMBEDDING=1
 
-The current development container lacks libc6-dev.
+### 3.4 CPU-to-NPU copies
 
-For validation, transfer the tensor to CPU before
-performing torch.isfinite().
+A pageable CPU tensor copied with `non_blocking=True` fails on this runtime.
+`Pi05Batch.to("npu")` now pins CPU input tensors before submitting an
+asynchronous NPU copy, and this is the default PI0.5 batch-transfer path.
+The full synchronous and asynchronous PI0.5 action outputs passed
+`allclose(atol=0.01, rtol=0.01)`.
 
-This is a compiler-environment issue under investigation,
-not evidence that all IsFinite implementations are
-unsupported by Ascend 310P1.
+Set the following variable only to force synchronous copies:
 
-### 3.4 CANN environment initialization
+    EMBODIINFER_ASCEND_SYNC_COPY=1
 
-Direct invocation:
+### 3.5 IsFinite operator and management interface
 
-    docker exec <container> python ...
+An isolated NPU `torch.isfinite()` check still fails in the current runtime.
+Validation copies the final action output to CPU before checking finiteness.
+Production PI0.5 inference does not depend on the failing check.
 
-may fail to import torch_npu because libhccl.so
-is not on the dynamic library search path.
+`npu-smi` reports a DCMI management-plane error on this device, while ACL and
+PyTorch NPU computation complete successfully. Treat this as a management
+interface issue unless it begins to affect compute workloads.
 
-Invoking Python through Bash works because the
-configured BASH_ENV initializes the CANN environment.
+### 3.6 CANN environment initialization
 
-Use the host-side helper script:
+Before running Python in the container, source the CANN environment without
+enabling shell `set -u`. Append to `PYTHONPATH`; do not replace it, because
+CANN packages such as `tbe` must remain visible:
 
-    ~/embodiinfer-ascend/scripts/npu_exec.sh
-
-This helper is part of the local deployment workspace,
-not currently part of the EmbodiInfer repository.
+    source /opt/ascend85/cann/set_env.sh
+    export PYTHONPATH=/workspace/EmbodiInfer:/workspace/tests/ascend:$PYTHONPATH
 
 ## 4. Validated inference configuration
 
-Device:
+Use these settings for the verified path:
 
-    npu
+- device: `npu`
+- EmbodiInfer attention: `eager`
+- PI0.5 vision attention: `eager`
+- default NPU Box-Muller noise
+- default NPU FP32 time embedding
+- default pinned asynchronous batch copy
+- `ASCEND_LAUNCH_BLOCKING` unset
 
-Attention:
+CUDA graphs and CUDA-specific fused optimizations are not part of this path.
 
-    eager
+## 5. Functional performance observation
 
-Noise fallback:
-
-    EMBODIINFER_ASCEND_CPU_NOISE=1
-
-Execution:
-
-    ASCEND_LAUNCH_BLOCKING unset
-
-CUDA Graphs and CUDA-specific fused optimizations
-are not used in this verified path.
-
-## 5. Functional performance observations
-
-Normal asynchronous mode:
-
-- Single request: approximately 27.20 s
-- Batch size 8: approximately 26.90 s
-- Total process wall time: approximately 235 s
-
-These are preliminary measurements of a synthetic model.
-
-They are not steady-state benchmarks:
-initialization, operator compilation, warmup and
-application-level timing boundaries have not been
-fully separated.
-
-Do not compare these values directly with published
-CUDA benchmark results.
+A real pi0.5 single-request forward pass completed in approximately 110
+seconds, including target-device execution in this development environment.
+This is a functional observation, not a steady-state benchmark. Initialization,
+operator compilation, warmup, exact checkpoint revision, image inputs, decode
+steps, and timing boundaries must be controlled before making a performance
+claim.
 
 ## 6. Reproduction
 
-The current local deployment workspace is:
+The deployment workspace is outside this repository. On the OrangePi host,
+run the prepared test with the CANN environment initialized:
 
-    ~/embodiinfer-ascend
+    source /opt/ascend85/cann/set_env.sh
+    export PYTHONPATH=/workspace/EmbodiInfer:/workspace/tests/ascend:$PYTHONPATH
+    cd /workspace/tests/ascend
+    /workspace/.home/envs/pi05-npu-py312-cann85/bin/python pi05_real_npu.py
 
-The following commands are run on the OrangePi host.
-
-Basic NPU check:
-
-    ./scripts/npu_exec.sh \
-      python -c 'import torch,torch_npu; print(torch.npu.is_available())'
-
-MockFlowVLA inference:
-
-    ./scripts/npu_exec.sh \
-      env -u ASCEND_LAUNCH_BLOCKING \
-      EMBODIINFER_ASCEND_CPU_NOISE=1 \
-      python /workspace/tests/ascend/quickstart_npu_eager.py
-
-The referenced smoke-test scripts currently reside
-outside the Git repository. They must be preserved
-separately or moved into the repository for fully
-self-contained reproduction.
+The Ascend smoke and capability scripts currently reside outside the Git
+repository. Preserve their output logs with the exact environment and
+checkpoint details, or promote stable hardware-gated coverage into the
+repository when CI or device access is available.
 
 ## 7. Remaining work
 
-- Add automated Ascend regression tests
-- Validate EagerAttention mask and numerical semantics
-- Resolve missing C/C++ compilation headers
-- Establish a stable, reproducible Docker image
-- Investigate Python 3.12 and LeRobot compatibility
-- Load a real pi0.5 checkpoint
-- Validate pi0.5 prefix encoding and denoising
-- Benchmark steady-state inference latency
+- Investigate an upstream CANN or torch_npu fix for native NPU `randn`
+- Evaluate SDPA or vendor-fused attention only after full PI0.5 regression
+- Investigate the NPU `torch.isfinite()` failure
+- Diagnose the `npu-smi` DCMI management-plane error
+- Add hardware-gated Ascend regression coverage to the repository
+- Establish a reproducible container definition and steady-state benchmark
