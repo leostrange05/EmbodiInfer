@@ -351,9 +351,21 @@ def _local_tokenizer_override(checkpoint: str) -> dict[str, dict[str, Any]]:
         raise ValueError(f"local pi05 preprocessor has no tokenizer name: {config_path}")
 
     try:
+        from huggingface_hub import try_to_load_from_cache
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, local_files_only=True)
+        # Transformers 5.3 may issue a Hub ``model_info`` query while loading
+        # Gemma-family tokenizers by repository name, even with
+        # ``local_files_only=True``. Resolve one required cached file first and
+        # hand AutoTokenizer its local snapshot directory; this retains offline
+        # operation and avoids treating a partial checkpoint cache as a network
+        # fallback.
+        cached_config = try_to_load_from_cache(
+            repo_id=tokenizer_name,
+            filename="tokenizer_config.json",
+        )
+        tokenizer_source = str(Path(cached_config).parent) if isinstance(cached_config, str) else tokenizer_name
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_source, local_files_only=True)
     except Exception as error:
         raise RuntimeError(
             f"tokenizer {tokenizer_name!r} is not available locally for checkpoint {checkpoint!r}"
