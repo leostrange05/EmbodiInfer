@@ -237,9 +237,14 @@ class OpenPiProcessor:
         keys = ("q01", "q99") if config.use_quantile_norm else ("mean", "std")
         for feature in ("state", "actions"):
             stats = data["norm_stats"][feature]
+            physical_dim = config.state_dim if feature == "state" else config.output_action_dim
             arrays = tuple(np.asarray(stats[key], dtype=np.float32) for key in keys)
-            if any(array.shape != (config.action_dim,) or not np.isfinite(array).all() for array in arrays):
+            if any(
+                array.ndim != 1 or array.shape[0] < physical_dim or not np.isfinite(array).all()
+                for array in arrays
+            ):
                 raise ValueError(f"OpenPI {feature} statistics must be finite action_dim vectors")
+            arrays = tuple(array[:physical_dim] for array in arrays)
             if config.use_quantile_norm:
                 if np.any(arrays[1] < arrays[0]):
                     raise ValueError(f"OpenPI {feature} q99 must be >= q01")
@@ -293,12 +298,12 @@ class OpenPiProcessor:
         """Normalize a single observation and build the common engine batch."""
         if tuple(state.shape) != (self.config.state_dim,) or not torch.isfinite(state).all():
             raise ValueError("OpenPI state does not match checkpoint state_dim")
-        padded = np.pad(state.cpu().numpy(), (0, self.config.action_dim - self.config.state_dim))
+        values = state.cpu().numpy()
         first, second = self.statistics["state"]
         normalized = (
-            (padded - first) / (second - first + 1e-6) * 2.0 - 1.0
+            (values - first) / (second - first + 1e-6) * 2.0 - 1.0
             if self.config.use_quantile_norm
-            else (padded - first) / (second + 1e-6)
+            else (values - first) / (second + 1e-6)
         )
         tokens, masks = self.tokenize(prompt, normalized)
         tensors = []
@@ -317,6 +322,7 @@ class OpenPiProcessor:
         if values.ndim != 2 or values.shape[1] != self.config.action_dim or not np.isfinite(values).all():
             raise ValueError("invalid OpenPI action chunk")
         first, second = self.statistics["actions"]
+        values = values[:, : self.config.output_action_dim]
         restored = (
             (values + 1.0) / 2.0 * (second - first + 1e-6) + first
             if self.config.use_quantile_norm
