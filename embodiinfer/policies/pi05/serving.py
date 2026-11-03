@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import threading
 from collections.abc import Mapping, Sequence
+from time import perf_counter
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -215,7 +216,9 @@ class Pi05ServingAdapter(ServingAdapter):
         against that request's state, including relative-action checkpoints.
         """
         outcomes: list[ModelResult | Exception] = [RuntimeError("unresolved batch row") for _ in requests]
+        adapter_started = perf_counter()
         with self._lock:
+            lock_acquired = perf_counter()
             prepared = []
             rows = []
             plans: list[AsyncInferencePlan | None] = []
@@ -236,6 +239,7 @@ class Pi05ServingAdapter(ServingAdapter):
                     outcomes[index] = error
             if not prepared:
                 return outcomes
+            prepared_at = perf_counter()
             batched = Pi05Batch.concatenate(prepared)
             guidance = (
                 batch_rtc_guidance(
@@ -246,16 +250,27 @@ class Pi05ServingAdapter(ServingAdapter):
                 if any(plan is not None and plan.rtc is not None and plan.rtc.enabled for plan in plans)
                 else None
             )
+            core_started = perf_counter()
             chunks = (
                 self._core.execute(batched)
                 if guidance is None
                 else self._core.execute(batched, rtc_guidance=guidance)
             )
+            core_finished = perf_counter()
             if len(chunks) != len(rows):
                 raise RuntimeError("pi05 model returned an incorrect number of action chunks")
             for (index, state_vec, session_id), chunk in zip(rows, chunks, strict=True):
                 try:
-                    result = self._result(chunk, state_vec)
+                    post_started = perf_counter()
+                    result = self._result(
+                        chunk,
+                        state_vec,
+                        timing={
+                            "adapter_lock_wait_ms": (lock_acquired - adapter_started) * 1000.0,
+                            "adapter_preprocess_ms": (prepared_at - lock_acquired) * 1000.0,
+                            "core_execute_ms": (core_finished - core_started) * 1000.0,
+                        },
+                    )
                     # RTC conditions on the *model's full action horizon*, even
                     # when the transport returns a shorter execution chunk. The
                     # client sends an offset into this cache at every replan.
@@ -266,7 +281,14 @@ class Pi05ServingAdapter(ServingAdapter):
                         if not hasattr(self, "_last_model_chunk"):
                             self._last_model_chunk = {}
                         self._last_model_chunk[session_id] = cached.detach().cpu().clone()
-                    outcomes[index] = result
+                    outcomes[index] = replace(
+                        result,
+                        timing={
+                            **result.timing,
+                            "adapter_postprocess_ms": (perf_counter() - post_started) * 1000.0,
+                            "adapter_total_ms": (perf_counter() - adapter_started) * 1000.0,
+                        },
+                    )
                 except (TypeError, ValueError, RuntimeError) as error:
                     outcomes[index] = error
         return outcomes
@@ -307,7 +329,13 @@ class Pi05ServingAdapter(ServingAdapter):
         grid = tuple(tuple(float(value) for value in row) for row in remaining.tolist())
         return replace(plan, rtc=replace(plan.rtc, prev_chunk_left_over=grid, model_space=True))
 
-    def _result(self, chunk: ActionChunk, state_vec: torch.Tensor) -> ModelResult:
+    def _result(
+        self,
+        chunk: ActionChunk,
+        state_vec: torch.Tensor,
+        *,
+        timing: Mapping[str, float] | None = None,
+    ) -> ModelResult:
         rows = max(1, min(int(self._config.return_steps), int(chunk.actions.shape[0])))
         action_rows = self._processor.restore_actions(chunk.actions[:rows], state_vec)
         actions = []
@@ -332,7 +360,7 @@ class Pi05ServingAdapter(ServingAdapter):
                     },
                 ),
             ),
-            timing={"policy_ms": float(chunk.latency_ms)},
+            timing={**dict(timing or {}), **chunk.timing, "policy_ms": float(chunk.latency_ms)},
             policy_revision=str(self._core.policy_version),
         )
 
