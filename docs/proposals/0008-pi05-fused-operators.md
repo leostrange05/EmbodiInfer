@@ -250,6 +250,67 @@ inference-only CUDA eval/no-grad execution and rejects training fallbacks.
 The native Pi05 decoder exposes only deterministic `ActionDecoder` capabilities;
 it does not advertise stochastic RL sampling or differentiable log-probability
 recomputation.
+
+## Ascend310P1 integration (2026-11-15)
+
+The `ascend/torch-npu` branch also exposes the measured FP32 PI0.5 NPU path:
+
+```python
+policy = make_policy(
+    "pi05",
+    checkpoint=checkpoint,
+    attention="eager",
+    vision_attention="eager",
+    compile_backend="torchair",
+    npu_prepared_ffn=True,
+)
+policy.requires_grad_(False)
+core = EngineCore(policy, EngineConfig(
+    device="npu", max_batch_size=1,
+    use_cuda_graph=False, capture_full_loop=False,
+))
+```
+
+`compile_backend="torchair"` selects the existing schedule cache with NPU stream
+and arithmetic-mode keys, static full-graph denoise compilation, and
+`cube_fp16in_fp32out`. It sets `jit_compile=False`. This profile requires
+Ascend310P1, FP32 master weights, eager attention, TP=1 and inference without
+autograd. It does not use ACL graph capture. The static suffix mask is initialized
+explicitly before compilation.
+
+`npu_prepared_ffn=True` prepares the expert's 54 bias-free gate/up/down projections
+as FP16 FRACTAL_NZ weights. The reusable module keeps the original parameter
+objects and checkpoint keys, excludes derived buffers from state_dict, and uses
+FP32 input/output interfaces. Training and autograd use ordinary linear math.
+Refit, weight loading and migration clear derived weights and compiled state.
+Set this option to false for the original-weight baseline.
+
+The isolated real-weight B1/H50/ten-step experiment measured 900.784 ms versus
+766.111 ms median over twelve paired requests and two synthetic observations.
+All pairs were faster and passed action comparison against the TorchAir plus
+schedule-cache reference at atol=rtol=0.005 (max absolute error 0.000830).
+The target 540 weight Cast and 540 TransData tasks disappeared. Timing included
+prepared CPU input through CPU action and excluded loading, first compilation
+and setup conversion. These measurements predate this integration; no new
+runtime validation was requested for integration. LIBERO success is unmeasured.
+The new graph's cross-process persistent compile cache is not integrated here.
+
+The same TorchAir profile now compiles the existing per-camera `embed_image`
+method, controlled by `npu_compile_vision=True` (false selects the preceding
+prepared-FFN baseline). Camera order, number of calls, precision configuration,
+prefix execution and denoise remain unchanged. The native-embedding path keeps
+its own image implementation. Cache invalidation restores the eager image method
+before rebuilding compiled state, including when entering training or migrating.
+
+An isolated experiment using the integrated prepared-FFN baseline measured
+776.639 ms versus 667.914 ms median over twelve paired requests, two synthetic
+observations and twelve explicit noises. Every observation used both AB/BA
+orders equally. All pairs were faster and passed action comparison at
+atol=rtol=0.005; max absolute error was 0.001787. This is a 14.0% E2E reduction
+against the same-run baseline, without camera batching or additional quantization.
+The initial vision graph call took 388.957 seconds including compilation and is
+excluded from steady-state timing. Experiment-only `cache_compile` artifacts for
+denoise and vision were archived locally and removed from the device.
 Numerical drift and task quality require separate evaluation. Measured gains
 include vision precision and execution-profile changes as well as kernel fusion;
 the original-numerics comparison reports the narrower operator-only benefit.

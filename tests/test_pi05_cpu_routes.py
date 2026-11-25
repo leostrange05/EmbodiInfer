@@ -177,6 +177,7 @@ def _dynamic_time_policy():
         adarms_cond[:, None, :],
         None,
     )
+    policy._time_embedding = Pi05Policy._time_embedding.__get__(policy, type(policy))
     policy._embed_suffix = Pi05Policy._embed_suffix.__get__(policy, type(policy))
     policy._get_optimizations = lambda: None
     policy._action_context = Pi05Policy._action_context.__get__(policy, type(policy))
