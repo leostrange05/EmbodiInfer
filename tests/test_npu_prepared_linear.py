@@ -1,10 +1,13 @@
 """CPU contracts for optional NPU-derived linear weights."""
 
 import torch
+import sys
+from types import SimpleNamespace
 from torch import nn
 from torch.nn import functional as F
 
 from embodiinfer.models.prepared_linear import NpuPreparedLinear
+from embodiinfer.backend.torch import npu_linear
 
 
 def test_preserves_parameters_state_dict_and_cpu_gradients():
@@ -49,3 +52,26 @@ def test_cache_is_not_serialized_and_is_cleared_on_lifecycle_changes():
     layer._prepared_key = ("sentinel",)
     layer.to(dtype=torch.float64)
     assert layer._prepared_weight is None and layer._prepared_key is None
+
+
+def test_optional_bias_preparation_preserves_parameters_and_cpu_fallback():
+    source = nn.Linear(4, 3, bias=True)
+    layer = NpuPreparedLinear(source, allow_bias=True).eval()
+    x = torch.randn(2, 5, 4)
+    assert layer.weight is source.weight and layer.bias is source.bias
+    with torch.no_grad():
+        layer.prepare()
+        torch.testing.assert_close(layer(x), F.linear(x, source.weight, source.bias), atol=0, rtol=0)
+    assert layer._prepared_weight is None
+    assert set(layer.state_dict()) == {"weight", "bias"}
+
+
+def test_prepared_backend_adds_bias_before_restoring_shape(monkeypatch):
+    backend = SimpleNamespace(npu_linear=lambda x, w: F.linear(x, w))
+    monkeypatch.setitem(sys.modules, "torch_npu", backend)
+    x = torch.randn(2, 5, 4)
+    weight = torch.randn(3, 4)
+    bias = torch.randn(3)
+    expected = (F.linear(x.reshape(-1, 4), weight) + bias).reshape(2, 5, 3)
+    torch.testing.assert_close(npu_linear.linear(x, weight, bias), expected, atol=0, rtol=0)
+    torch.testing.assert_close(npu_linear.linear(x, weight), F.linear(x, weight), atol=0, rtol=0)

@@ -19,12 +19,13 @@ class NpuPreparedLinear(nn.Linear):
     Call prepare() before compiling an inference region.
     """
 
-    def __init__(self, source: nn.Linear) -> None:
+    def __init__(self, source: nn.Linear, *, allow_bias: bool = False) -> None:
         nn.Module.__init__(self)
         self.in_features = source.in_features
         self.out_features = source.out_features
         self.weight = source.weight
         self.bias = source.bias
+        self._allow_prepared_bias = allow_bias
         self.register_buffer("_prepared_weight", None, persistent=False)
         self._prepared_key: tuple | None = None
         self.training = source.training
@@ -37,7 +38,11 @@ class NpuPreparedLinear(nn.Linear):
     def prepare(self) -> None:
         """Refresh the derived weight outside the compiled inference region."""
         weight = self.weight
-        if weight.device.type != "npu" or weight.dtype != torch.float32 or self.bias is not None:
+        if (
+            weight.device.type != "npu"
+            or weight.dtype != torch.float32
+            or (self.bias is not None and not self._allow_prepared_bias)
+        ):
             self.clear()
             return
         version = None if torch.is_inference(weight) else weight._version
@@ -68,11 +73,11 @@ class NpuPreparedLinear(nn.Linear):
             or inputs.device.type != "npu"
             or inputs.dtype != torch.float32
             or self.weight.dtype != torch.float32
-            or self.bias is not None
+            or (self.bias is not None and not self._allow_prepared_bias)
         ):
             return F.linear(inputs, self.weight, self.bias)
         if not torch.compiler.is_compiling():
             self.prepare()
         if self._prepared_weight is None:
             raise RuntimeError("Prepare NPU linear weights before compiling inference")
-        return npu_linear.linear(inputs, self._prepared_weight)
+        return npu_linear.linear(inputs, self._prepared_weight, self.bias)

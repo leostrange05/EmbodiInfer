@@ -342,3 +342,38 @@ held-out observations and all timed pairs passed the frozen normalized and
 physical action gates. A three-task/two-state regression passed 6/6 for both
 routes. This small validation does not establish full task or deployment parity.
 The candidate remains opt-in, with the original path as fallback.
+
+### Prefix FFN and vision prepared-weight candidates
+
+The integration candidates `npu_prefix_ffn_graph` and `npu_prepared_vision` are
+disabled by default and require the TorchAir profile. The prefix candidate keeps
+FP32 master parameters and derives FP16 FRACTAL_NZ gate/up/down weights for each
+prefix layer, passing them explicitly to one shared, shape-specialized FFN graph.
+The vision candidate prepares linear weights similarly, preserves FP32 bias
+addition and uses a compiled image graph with non-frozen parameters. It requires
+compiled non-native image embeddings. Original checkpoints retain their parameter
+keys; derived tensors must be cleared on refit, weight loading, train transitions
+and device migration. The ordinary linear path is retained for training, autograd
+and unsupported devices/dtypes.
+
+These features can require several GiB of additional persistent device memory.
+First preparation and graph compilation are not steady-state inference time.
+Independent experiments suggest substantial gains, but this implementation is a
+candidate until same-configuration action, task and performance gates pass on the
+actual integrated path. Do not enable it by default or treat experimental results
+as measurements of this implementation before those checks.
+
+For `pi05_libero` on Ascend 310P1, batch 1, horizon 10 and 10 denoising
+steps, an integrated public-constructor run with both candidates and bucket 576
+produced a 338.64 ms policy P50 over 36 warmed requests; model loading and cold
+compilation are excluded. A loopback PNG/HTTP path had 441.79 ms P50 over 10
+requests. Six matched task/initial-state scenarios succeeded in both the
+historical reference and the candidate, but ran in separate processes. Against
+the historical prepared-prefix reference, 12 prechecks and 36 physical-action
+comparisons passed the original empirical thresholds with no gripper sign flips.
+Against the historical compiled-FFN reference, one of 36 physical-action
+comparisons exceeded the empirical RMSE threshold (0.00017421 versus
+0.00016797); it also had no gripper sign flip. These results support an opt-in
+integration and do not establish full LIBERO task parity or a same-run paired
+performance improvement. Model weights, inputs and seeds were pinned; the
+reference already used prefix weight preparation and a scale-mask optimization.

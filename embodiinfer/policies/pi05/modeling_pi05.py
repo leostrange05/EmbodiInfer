@@ -512,6 +512,8 @@ class Pi05Policy(FlowVLAPolicy):
         npu_prepared_ffn: bool = True,
         npu_compile_vision: bool = True,
         npu_prefix_bucket: int | None = None,
+        npu_prefix_ffn_graph: bool = False,
+        npu_prepared_vision: bool = False,
     ):
         super().__init__(config)
         if optimizations is not None:
@@ -542,6 +544,12 @@ class Pi05Policy(FlowVLAPolicy):
         self.compile_backend = compile_backend
         self.npu_prepared_ffn = npu_prepared_ffn
         self.npu_compile_vision = npu_compile_vision
+        if (npu_prefix_ffn_graph or npu_prepared_vision) and compile_backend != "torchair":
+            raise ValueError("PI0.5 NPU prefix FFN and prepared vision require TorchAir")
+        if npu_prepared_vision and (not npu_compile_vision or native_embeddings):
+            raise ValueError("Prepared vision requires compiled non-native image embeddings")
+        self.npu_prefix_ffn_graph = npu_prefix_ffn_graph
+        self.npu_prepared_vision = npu_prepared_vision
         if npu_prefix_bucket is not None and (type(npu_prefix_bucket) is not int or npu_prefix_bucket != 576):
             raise ValueError("PI0.5 NPU prefix bucket must be None or 576")
         if npu_prefix_bucket is not None and compile_backend != "torchair":
@@ -550,6 +558,7 @@ class Pi05Policy(FlowVLAPolicy):
         self._npu_compiled_denoise = None
         self._npu_compiled_image = None
         self._npu_eager_image = None
+        self._npu_compiled_prefix_ffn = None
         if denoise_attention not in {"sdpa", "triton"} or prefix_attention not in {"sdpa", "triton"}:
             raise ValueError("PI0.5 denoise_attention must be 'sdpa' or 'triton'")
         if (
@@ -791,6 +800,7 @@ class Pi05Policy(FlowVLAPolicy):
         self._npu_eager_image = None
         self._npu_compiled_image = None
         self._npu_compiled_denoise = None
+        self._npu_compiled_prefix_ffn = None
         runtime = getattr(self, "_runtime", None)
         if runtime is not None:
             runtime.clear()
@@ -861,6 +871,19 @@ class Pi05Policy(FlowVLAPolicy):
                         setattr(layer.mlp, name, module)
                     if isinstance(module, NpuPreparedLinear):
                         module.prepare()
+        if self.npu_prefix_ffn_graph and self._npu_compiled_prefix_ffn is None:
+            from .inference.npu import compile_prefix_ffn
+
+            for layer in self._prefix_tower.layers:
+                for name in ("gate_proj", "up_proj", "down_proj"):
+                    module = getattr(layer.mlp, name)
+                    if type(module) is nn.Linear and module.bias is None:
+                        module = NpuPreparedLinear(module)
+                        setattr(layer.mlp, name, module)
+                    if not isinstance(module, NpuPreparedLinear) or module.bias is not None:
+                        raise ValueError("Prepared prefix FFN requires bias-free linear projections")
+                    module.prepare()
+            self._npu_compiled_prefix_ffn = compile_prefix_ffn()
         if self.compile_backend == "torchair" and self._npu_compiled_denoise is None:
             from .inference.npu import compile_denoise
 
@@ -875,8 +898,20 @@ class Pi05Policy(FlowVLAPolicy):
             from .inference.npu import compile_image
 
             model = self._m.paligemma_with_expert
+            if self.npu_prepared_vision:
+                vision = model.paligemma.model.vision_tower
+                for name, module in list(vision.named_modules()):
+                    if type(module) is nn.Linear:
+                        parent_name, _, leaf_name = name.rpartition(".")
+                        parent = vision.get_submodule(parent_name) if parent_name else vision
+                        module = NpuPreparedLinear(module, allow_bias=True)
+                        setattr(parent, leaf_name, module)
+                    if isinstance(module, NpuPreparedLinear):
+                        module.prepare()
             self._npu_eager_image = model.embed_image
-            self._npu_compiled_image = compile_image(self._npu_eager_image)
+            self._npu_compiled_image = compile_image(
+                self._npu_eager_image, frozen_parameter=not self.npu_prepared_vision
+            )
             model.embed_image = self._npu_compiled_image
 
     def _quantize_towers(self, config: QuantizationConfig) -> None:
@@ -1100,16 +1135,30 @@ class Pi05Policy(FlowVLAPolicy):
                 fused,
                 self._kernels,
             )
-            hidden = _gated_residual(
-                residual,
-                _mlp(
+            compiled_prefix_ffn = getattr(self, "_npu_compiled_prefix_ffn", None)
+            if (
+                tower is getattr(self, "_prefix_tower", None)
+                and compiled_prefix_ffn is not None
+                and not self.training
+                and not torch.is_grad_enabled()
+                and h.device.type == "npu"
+            ):
+                projections = (layer.mlp.gate_proj, layer.mlp.up_proj, layer.mlp.down_proj)
+                if any(not isinstance(p, NpuPreparedLinear) or p._prepared_weight is None for p in projections):
+                    raise RuntimeError("Prepare prefix FFN weights before executing its NPU graph")
+                mlp_output = compiled_prefix_ffn(h, *(p._prepared_weight for p in projections))
+            else:
+                mlp_output = _mlp(
                     layer.mlp,
                     h,
                     self.compile_backend == "inductor",
                     fused,
                     fuse_projections=self.attention != "eager",
                     kernels=self._kernels,
-                ),
+                )
+            hidden = _gated_residual(
+                residual,
+                mlp_output,
                 gate,
                 self.compile_backend == "inductor",
                 fused,
@@ -1137,6 +1186,17 @@ class Pi05Policy(FlowVLAPolicy):
         config = getattr(self, "_optimization_config", None)
         if return_hidden and config is not None and config.numerics == "openpi_rlinf":
             raise ValueError("openpi_rlinf numerics support inference without return_hidden")
+        if (
+            (getattr(self, "npu_prefix_ffn_graph", False) or getattr(self, "npu_prepared_vision", False))
+            and not self.training
+            and not torch.is_grad_enabled()
+            and self._m.action_in_proj.weight.device.type == "npu"
+            and (
+                (self.npu_prefix_ffn_graph and self._npu_compiled_prefix_ffn is None)
+                or (self.npu_prepared_vision and self._npu_compiled_image is None)
+            )
+        ):
+            self._prepare_npu_inference()
         if self._native_enabled() and not return_hidden:
             self._prepare_native_attention()
             return self._runtime.encode(batch, return_hidden)
@@ -1565,6 +1625,8 @@ def _build_pi05(
     npu_prepared_ffn: bool = True,
     npu_compile_vision: bool = True,
     npu_prefix_bucket: int | None = None,
+    npu_prefix_ffn_graph: bool = False,
+    npu_prepared_vision: bool = False,
     low_cpu_mem_usage: bool = False,
     checkpoint_config: Mapping[str, Any] | None = None,
     device_type: str | None = None,
@@ -1617,6 +1679,8 @@ def _build_pi05(
         npu_prepared_ffn=npu_prepared_ffn,
         npu_compile_vision=npu_compile_vision,
         npu_prefix_bucket=npu_prefix_bucket,
+        npu_prefix_ffn_graph=npu_prefix_ffn_graph,
+        npu_prepared_vision=npu_prepared_vision,
         low_cpu_mem_usage=low_cpu_mem_usage,
         checkpoint_config=checkpoint_config,
         optimizations=optimizations,
