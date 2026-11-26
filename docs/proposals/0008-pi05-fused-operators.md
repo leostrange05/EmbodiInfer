@@ -314,3 +314,31 @@ denoise and vision were archived locally and removed from the device.
 Numerical drift and task quality require separate evaluation. Measured gains
 include vision precision and execution-profile changes as well as kernel fusion;
 the original-numerics comparison reports the narrower operator-only benefit.
+
+### Guarded prefix padding compaction (experimental integration)
+
+The optional `npu_prefix_bucket=576` policy setting permits the TorchAir NPU
+inference path to discard trailing prefix padding before building attention
+masks and executing the prefix tower. The default is `None`, preserving existing
+behavior. The setting is currently restricted to batch one, an original length
+of 712, eval/no-grad inference without returned hidden states, and a contiguous
+nonempty valid prefix ending at or before token 576. If input masks or shapes do
+not meet this contract, the original tensors are retained. Invalid bucket settings
+are rejected. The setting does not enable Prompt Flash Attention.
+
+The resulting shorter pad mask and K/V cache must propagate to denoise, with
+position IDs and attention masks computed from the compacted tensors. Graphs
+must be keyed or recompiled for their actual prefix length. Cache invalidation,
+training, output interfaces, and unsupported inputs must retain their original
+semantics. This option is not a claim of general correctness for arbitrary masks,
+camera counts, model variants, or training.
+
+On Ascend310P1 with pi05_libero, B1, horizon 10 and 10 denoise steps, the
+integrated candidate was measured against the committed TorchAir/expert-FFN/
+vision-graph baseline without the separate experimental fusion patches. Policy
+P50 fell from 590.18 to 547.39 ms across 36 interleaved paired requests over six
+simulation observations; loading and warmup were excluded. Twelve initial and
+held-out observations and all timed pairs passed the frozen normalized and
+physical action gates. A three-task/two-state regression passed 6/6 for both
+routes. This small validation does not establish full task or deployment parity.
+The candidate remains opt-in, with the original path as fallback.

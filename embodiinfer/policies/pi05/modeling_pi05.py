@@ -511,6 +511,7 @@ class Pi05Policy(FlowVLAPolicy):
         tensor_parallel_group=None,
         npu_prepared_ffn: bool = True,
         npu_compile_vision: bool = True,
+        npu_prefix_bucket: int | None = None,
     ):
         super().__init__(config)
         if optimizations is not None:
@@ -541,6 +542,11 @@ class Pi05Policy(FlowVLAPolicy):
         self.compile_backend = compile_backend
         self.npu_prepared_ffn = npu_prepared_ffn
         self.npu_compile_vision = npu_compile_vision
+        if npu_prefix_bucket is not None and (type(npu_prefix_bucket) is not int or npu_prefix_bucket != 576):
+            raise ValueError("PI0.5 NPU prefix bucket must be None or 576")
+        if npu_prefix_bucket is not None and compile_backend != "torchair":
+            raise ValueError("PI0.5 NPU prefix compaction requires compile_backend='torchair'")
+        self.npu_prefix_bucket = npu_prefix_bucket
         self._npu_compiled_denoise = None
         self._npu_compiled_image = None
         self._npu_eager_image = None
@@ -1168,6 +1174,18 @@ class Pi05Policy(FlowVLAPolicy):
                 batch.masks,
                 self.compile_backend == "inductor",
             )
+        if (
+            getattr(self, "npu_prefix_bucket", None) is not None
+            and prefix_embs.device.type == "npu"
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not return_hidden
+        ):
+            from .inference.prefix_compaction import compact_pi05_prefix
+
+            prefix_embs, prefix_pad_masks, prefix_att_masks = compact_pi05_prefix(
+                prefix_embs, prefix_pad_masks, prefix_att_masks, bucket=self.npu_prefix_bucket
+            )
         prefix_att_2d = self._make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         if all_valid is None:
@@ -1546,6 +1564,7 @@ def _build_pi05(
     kernel_profile: str = "none",
     npu_prepared_ffn: bool = True,
     npu_compile_vision: bool = True,
+    npu_prefix_bucket: int | None = None,
     low_cpu_mem_usage: bool = False,
     checkpoint_config: Mapping[str, Any] | None = None,
     device_type: str | None = None,
@@ -1597,6 +1616,7 @@ def _build_pi05(
         kernel_profile=kernel_profile,
         npu_prepared_ffn=npu_prepared_ffn,
         npu_compile_vision=npu_compile_vision,
+        npu_prefix_bucket=npu_prefix_bucket,
         low_cpu_mem_usage=low_cpu_mem_usage,
         checkpoint_config=checkpoint_config,
         optimizations=optimizations,
