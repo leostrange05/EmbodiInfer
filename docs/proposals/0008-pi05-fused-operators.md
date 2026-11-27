@@ -250,6 +250,138 @@ inference-only CUDA eval/no-grad execution and rejects training fallbacks.
 The native Pi05 decoder exposes only deterministic `ActionDecoder` capabilities;
 it does not advertise stochastic RL sampling or differentiable log-probability
 recomputation.
+
+## Ascend310P1 integration (2026-11-15)
+
+The `ascend/torch-npu` branch also exposes the measured FP32 PI0.5 NPU path:
+
+```python
+policy = make_policy(
+    "pi05",
+    checkpoint=checkpoint,
+    attention="eager",
+    vision_attention="eager",
+    compile_backend="torchair",
+    npu_prepared_ffn=True,
+)
+policy.requires_grad_(False)
+core = EngineCore(policy, EngineConfig(
+    device="npu", max_batch_size=1,
+    use_cuda_graph=False, capture_full_loop=False,
+))
+```
+
+`compile_backend="torchair"` selects the existing schedule cache with NPU stream
+and arithmetic-mode keys, static full-graph denoise compilation, and
+`cube_fp16in_fp32out`. It sets `jit_compile=False`. This profile requires
+Ascend310P1, FP32 master weights, eager attention, TP=1 and inference without
+autograd. It does not use ACL graph capture. The static suffix mask is initialized
+explicitly before compilation.
+
+`npu_prepared_ffn=True` prepares the expert's 54 bias-free gate/up/down projections
+as FP16 FRACTAL_NZ weights. The reusable module keeps the original parameter
+objects and checkpoint keys, excludes derived buffers from state_dict, and uses
+FP32 input/output interfaces. Training and autograd use ordinary linear math.
+Refit, weight loading and migration clear derived weights and compiled state.
+Set this option to false for the original-weight baseline.
+
+The isolated real-weight B1/H50/ten-step experiment measured 900.784 ms versus
+766.111 ms median over twelve paired requests and two synthetic observations.
+All pairs were faster and passed action comparison against the TorchAir plus
+schedule-cache reference at atol=rtol=0.005 (max absolute error 0.000830).
+The target 540 weight Cast and 540 TransData tasks disappeared. Timing included
+prepared CPU input through CPU action and excluded loading, first compilation
+and setup conversion. These measurements predate this integration; no new
+runtime validation was requested for integration. LIBERO success is unmeasured.
+The new graph's cross-process persistent compile cache is not integrated here.
+
+The same TorchAir profile now compiles the existing per-camera `embed_image`
+method, controlled by `npu_compile_vision=True` (false selects the preceding
+prepared-FFN baseline). Camera order, number of calls, precision configuration,
+prefix execution and denoise remain unchanged. The native-embedding path keeps
+its own image implementation. Cache invalidation restores the eager image method
+before rebuilding compiled state, including when entering training or migrating.
+
+An isolated experiment using the integrated prepared-FFN baseline measured
+776.639 ms versus 667.914 ms median over twelve paired requests, two synthetic
+observations and twelve explicit noises. Every observation used both AB/BA
+orders equally. All pairs were faster and passed action comparison at
+atol=rtol=0.005; max absolute error was 0.001787. This is a 14.0% E2E reduction
+against the same-run baseline, without camera batching or additional quantization.
+The initial vision graph call took 388.957 seconds including compilation and is
+excluded from steady-state timing. Experiment-only `cache_compile` artifacts for
+denoise and vision were archived locally and removed from the device.
 Numerical drift and task quality require separate evaluation. Measured gains
 include vision precision and execution-profile changes as well as kernel fusion;
 the original-numerics comparison reports the narrower operator-only benefit.
+
+### Guarded prefix padding compaction (experimental integration)
+
+The optional `npu_prefix_bucket=576` policy setting permits the TorchAir NPU
+inference path to discard trailing prefix padding before building attention
+masks and executing the prefix tower. The default is `None`, preserving existing
+behavior. The setting is currently restricted to batch one, an original length
+of 712, eval/no-grad inference without returned hidden states, and a contiguous
+nonempty valid prefix ending at or before token 576. If input masks or shapes do
+not meet this contract, the original tensors are retained. Invalid bucket settings
+are rejected. The setting does not enable Prompt Flash Attention.
+
+The resulting shorter pad mask and K/V cache must propagate to denoise, with
+position IDs and attention masks computed from the compacted tensors. Graphs
+must be keyed or recompiled for their actual prefix length. Cache invalidation,
+training, output interfaces, and unsupported inputs must retain their original
+semantics. This option is not a claim of general correctness for arbitrary masks,
+camera counts, model variants, or training.
+
+On Ascend310P1 with pi05_libero, B1, horizon 10 and 10 denoise steps, the
+integrated candidate was measured against the committed TorchAir/expert-FFN/
+vision-graph baseline without the separate experimental fusion patches. Policy
+P50 fell from 590.18 to 547.39 ms across 36 interleaved paired requests over six
+simulation observations; loading and warmup were excluded. Twelve initial and
+held-out observations and all timed pairs passed the frozen normalized and
+physical action gates. A three-task/two-state regression passed 6/6 for both
+routes. This small validation does not establish full task or deployment parity.
+The candidate remains opt-in, with the original path as fallback.
+
+### Prefix FFN and vision prepared-weight candidates
+
+The opt-in PI0.5 `backend_profile="ascend310p1"` groups the existing TorchAir,
+expert preparation, vision graph, prefix FFN and vision weight preparation
+settings without enabling Prefix compaction. It validates the execution device
+at evaluation time; prior individual flags and the default non-profile path
+remain available. It is a model-specific profile, not generic NPU detection or a
+claim that the same settings support other hardware. See the maintained Ascend
+compatibility notes for setup and device constraints.
+
+The integration candidates `npu_prefix_ffn_graph` and `npu_prepared_vision` are
+disabled by default and require the TorchAir profile. The prefix candidate keeps
+FP32 master parameters and derives FP16 FRACTAL_NZ gate/up/down weights for each
+prefix layer, passing them explicitly to one shared, shape-specialized FFN graph.
+The vision candidate prepares linear weights similarly, preserves FP32 bias
+addition and uses a compiled image graph with non-frozen parameters. It requires
+compiled non-native image embeddings. Original checkpoints retain their parameter
+keys; derived tensors must be cleared on refit, weight loading, train transitions
+and device migration. The ordinary linear path is retained for training, autograd
+and unsupported devices/dtypes.
+
+These features can require several GiB of additional persistent device memory.
+First preparation and graph compilation are not steady-state inference time.
+Independent experiments suggest substantial gains, but this implementation is a
+candidate until same-configuration action, task and performance gates pass on the
+actual integrated path. Do not enable it by default or treat experimental results
+as measurements of this implementation before those checks.
+
+For `pi05_libero` on Ascend 310P1, batch 1, horizon 10 and 10 denoising
+steps, an integrated public-constructor run with both candidates and bucket 576
+produced a 338.64 ms policy P50 over 36 warmed requests; model loading and cold
+compilation are excluded. A loopback PNG/HTTP path had 441.79 ms P50 over 10
+requests. Six matched task/initial-state scenarios succeeded in both the
+historical reference and the candidate, but ran in separate processes. Against
+the historical prepared-prefix reference, 12 prechecks and 36 physical-action
+comparisons passed the original empirical thresholds with no gripper sign flips.
+Against the historical compiled-FFN reference, one of 36 physical-action
+comparisons exceeded the empirical RMSE threshold (0.00017421 versus
+0.00016797); it also had no gripper sign flip. These results support an opt-in
+integration and do not establish full LIBERO task parity or a same-run paired
+performance improvement. Model weights, inputs and seeds were pinned; the
+reference already used prefix weight preparation and a scale-mask optimization.

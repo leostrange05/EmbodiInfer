@@ -171,6 +171,11 @@ uv run --no-sync python examples/pi05_inference.py \
 该示例加载真实权重，但输入仍为合成观测，用来演示引擎 API。
 真实图像与状态接入见[服务教程](docs/zh/serving.md#send-your-first-observation)。
 
+昇腾 310P1 可通过 `make_policy("pi05", checkpoint=..., backend_profile="ascend310p1")`
+显式选择 π0.5 的昇腾配置，并在引擎中选择 NPU。该路径需要单独的 CANN / torch_npu
+环境，上面的 CUDA 示例不会自动启用它；环境、适用条件和调用方式见
+[昇腾 310P1 兼容性说明](docs/ascend-310p1-compatibility.md)。
+
 ### 选择接入方式
 
 | 用途 | 接口 | 入口 |

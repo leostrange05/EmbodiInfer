@@ -191,6 +191,12 @@ the engine API. Follow [Quick start](docs/en/quickstart.md) for the input contra
 and [Serving](docs/en/serving.md) to connect real observations and configure their
 mapping to a checkpoint.
 
+For Ascend 310P1, the opt-in PI0.5 configuration uses
+`make_policy("pi05", checkpoint=..., backend_profile="ascend310p1")` and an
+NPU `EngineConfig`. It has a separate CANN / torch_npu environment and is not
+enabled by the CUDA example above. See [Ascend 310P1 compatibility](docs/ascend-310p1-compatibility.md)
+for setup, supported conditions and the model execution example.
+
 ### Choose an integration
 
 | Workflow | Interface | Start here |

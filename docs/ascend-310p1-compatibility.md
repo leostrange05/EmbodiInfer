@@ -23,6 +23,58 @@ Software:
 
 Development container: `embodiinfer-ascend-cann85`.
 
+## PI0.5 backend profile and code ownership
+
+The optional `backend_profile="ascend310p1"` is the explicit PI0.5 policy
+configuration for the validated 310P1 TorchAir path. It selects eager policy
+and vision attention, TorchAir denoise and vision graphs, and prepared Expert,
+Prefix FFN and vision weights. Prefix padding compaction stays disabled unless
+`npu_prefix_bucket=576` is explicitly requested. The profile is opt-in;
+existing calls without `backend_profile` retain their previous defaults.
+
+```python
+import torch_npu  # Register the NPU device before constructing the engine.
+from embodiinfer import EngineConfig, EngineCore, make_policy
+
+policy = make_policy(
+    "pi05", checkpoint="/path/to/pi05_libero",
+    load_device="cpu", low_cpu_mem_usage=True,
+    backend_profile="ascend310p1",
+    action_horizon=10, default_num_steps=10,
+)
+core = EngineCore(
+    policy,
+    EngineConfig(device="npu", max_batch_size=1, use_cuda_graph=False),
+)
+```
+
+This is a configuration example, not a complete observation-to-action program.
+The model is loaded on CPU and `EngineCore` moves it to NPU before entering eval
+mode. The profile requires the actual execution device to be an Ascend310P1
+with FP32 master weights. An incompatible device or contradictory execution
+mode raises an error; it does not silently select an NVIDIA or generic NPU
+backend. Optional features can be explicitly disabled with their existing flags.
+The profile cannot be combined with CUDA `preset` / `optimizations`; legacy
+`compile_backend` and individual NPU options remain supported without the profile.
+
+`backend_profile` is policy-specific. It does not imply support for other Ascend
+models, other vendors, or automatic device detection. New backends should add
+their own explicit profile and validation rather than treating every `npu`
+device as Ascend. The HTTP serving factory accepts the same policy option in
+`policy_kwargs` within the existing adapter configuration.
+
+The branch's changes since main are organized by ownership:
+
+- `policies/pi05/` owns model, attention/precision compatibility, OpenPI
+  checkpoint conversion and the PI0.5 serving/processor contracts.
+- `policies/pi05/inference/` owns PI0.5 backend profiles, TorchAir scheduling,
+  and guarded Prefix compaction; `backend/torch/npu_linear.py` owns NPU linear
+  operations, and `models/prepared_linear.py` owns reusable derived weights.
+- `policies/base.py` and `engine/serve/http_server.py` contain shared device and
+  HTTP compatibility changes; CUDA implementations remain in their own paths.
+- `tests/` contains compatibility, policy lifecycle and HTTP coverage. LIBERO
+  environments and evaluation scripts are downstream, not part of this package.
+
 ## 2. Verified functionality
 
 The following checks have passed in the environment above:

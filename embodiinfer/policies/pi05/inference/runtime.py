@@ -99,7 +99,17 @@ def _tensor_key(tensor: torch.Tensor) -> tuple:
 
 
 def _stream_key(device: torch.device) -> int:
+    if device.type == "npu":
+        return int(torch.npu.current_stream(device).npu_stream)
     return torch.cuda.current_stream(device).cuda_stream
+
+
+def _schedule_execution_signature(device: torch.device) -> tuple:
+    if device.type == "npu":
+        from .npu import execution_signature
+
+        return execution_signature()
+    return cuda_execution_signature()
 
 
 def _clone_prefix(prefix: Pi05Prefix) -> Pi05Prefix:
@@ -358,7 +368,7 @@ class Pi05Runtime:
             state.dtype,
             state.device,
             _stream_key(state.device),
-            cuda_execution_signature(),
+            _schedule_execution_signature(state.device),
         )
         cached = self.schedules.get(key)
         if cached is None:
@@ -388,7 +398,12 @@ class Pi05Runtime:
         device_context = torch.cuda.device(state.device) if state.is_cuda else nullcontext()
         with device_context, context:
             for t, dt, modulations in self.schedule(state, steps):
-                velocity = self.policy._denoise_step_impl(x, t, prefix, modulations)
+                step = (
+                    self.policy._npu_compiled_denoise
+                    if state.device.type == "npu" and self.policy.compile_backend == "torchair"
+                    else self.policy._denoise_step_impl
+                )
+                velocity = step(x, t, prefix, modulations)
                 x = euler_step(x, velocity, dt)
         return x
 
@@ -502,7 +517,7 @@ class Pi05FlowDecoder(FlowActionDecoder):
         *,
         guidance=None,
     ) -> torch.Tensor:
-        """Return model-space actions using cached schedules for CUDA eval without autograd.
+        """Return actions using cached schedules for native CUDA or TorchAir NPU inference.
 
         RTC guidance deliberately takes the generic eager path: soft RTC needs a
         Jacobian-vector product through the velocity field and cannot be served
@@ -513,6 +528,13 @@ class Pi05FlowDecoder(FlowActionDecoder):
             raise ValueError("Flow decoding requires an initial state")
         if guidance is not None and guidance.enabled:
             return super().integrate(state, prefix, num_steps, bucket, graphs, guidance=guidance)
+        if policy.compile_backend == "torchair":
+            if state.device.type != "npu" or bucket != 1 or state.shape[0] != bucket:
+                raise ValueError("PI0.5 TorchAir currently requires NPU batch size 1")
+            if policy.training or torch.is_grad_enabled():
+                raise RuntimeError("PI0.5 TorchAir requires eval mode without autograd")
+            policy._prepare_npu_inference()
+            return policy._runtime.integrate(state, prefix, num_steps)
         if not policy._native_enabled() or state.device.type != "cuda":
             return super().integrate(state, prefix, num_steps, bucket, graphs)
         if state.shape[0] != bucket:
