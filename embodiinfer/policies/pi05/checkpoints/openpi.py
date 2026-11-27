@@ -153,8 +153,13 @@ def load_openpi_checkpoint(
     from safetensors.torch import load_file
 
     if low_cpu_mem_usage:
+        native_config = recipe.native_config()
+        # PI05Policy eagerly calls model.to(config.device) in its constructor.
+        # Keep that destination on meta until strict assignment provides real
+        # tensors, avoiding a meta-to-CPU copy of nonexistent data.
+        native_config.device = "meta"
         with torch.device("meta"):
-            model = PI05Policy(recipe.native_config())
+            model = PI05Policy(native_config)
     else:
         model = PI05Policy(recipe.native_config())
     tensors = load_file(str(weights), device="cpu")
@@ -184,6 +189,7 @@ def load_openpi_checkpoint(
         from .lerobot import _materialize_buffers
 
         _materialize_buffers(model, torch.device("cpu"))
+        model.config.device = "cpu"
     else:
         model.model.load_state_dict(tensors, strict=True)
     del tensors

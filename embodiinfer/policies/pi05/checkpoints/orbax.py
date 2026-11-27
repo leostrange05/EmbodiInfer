@@ -172,7 +172,19 @@ def cached_orbax_weights(root: Path) -> Path:
         logger.warning("Converting OpenPI Orbax checkpoint on CPU (first load): %s", root)
         with ocp.PyTreeCheckpointer() as checkpointer:
             metadata = checkpointer.metadata((root / "params").resolve())
-            item = {"params": metadata["params"]}
+            # Orbax <= 0.11 returned a mapping here. Orbax 0.12 returns a
+            # StepMetadata dataclass whose item_metadata.tree retains the
+            # same PyTree layout. Support both without changing restoration
+            # semantics or weakening the checkpoint's tensor validation.
+            if isinstance(metadata, Mapping):
+                params_metadata = metadata.get("params")
+            else:
+                item_metadata = getattr(metadata, "item_metadata", None)
+                tree = getattr(item_metadata, "tree", None)
+                params_metadata = tree.get("params") if isinstance(tree, Mapping) else None
+            if params_metadata is None:
+                raise ValueError("Orbax checkpoint metadata is missing params")
+            item = {"params": params_metadata}
             restored = checkpointer.restore(
                 (root / "params").resolve(),
                 ocp.args.PyTreeRestore(

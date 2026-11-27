@@ -343,6 +343,25 @@ def test_openpi_actions_restore_observation_relative_chunk_not_cumulative(openpi
     torch.testing.assert_close(processor.restore_actions(normalized, state), actual, rtol=0, atol=0)
 
 
+def test_openpi_uses_physical_dimension_statistics_before_model_padding(openpi_recipe):
+    """LIBERO stores 8-D state / 7-D action statistics for a 32-D Pi0.5 model."""
+    path = Path(openpi_recipe.norm_stats)
+    payload = json.loads(path.read_text())
+    for feature in ("state", "actions"):
+        payload["norm_stats"][feature] = {
+            key: values[:3] for key, values in payload["norm_stats"][feature].items()
+        }
+    path.write_text(json.dumps(payload))
+    processor = OpenPiProcessor(replace(openpi_recipe, discrete_state_input=True, delta_action_mask=()))
+
+    images = {"base": torch.zeros(3, 224, 224), "wrist": torch.zeros(3, 224, 224)}
+    processor.prepare(torch.tensor([0.0, 1.0, 2.0]), images, "pick")
+    assert processor.tokenizer.calls == [("Task: pick, State: 128 192 255;\nAction: ", True)]
+
+    restored = processor.restore_actions(torch.tensor([[-1.0, 0.0, 1.0, 123.0]]), torch.zeros(3))
+    np.testing.assert_allclose(restored.numpy(), [[-2.0, 0.0, 2.0]], rtol=0, atol=2e-6)
+
+
 def test_openpi_camera_order_and_missing_camera(openpi_recipe):
     processor = OpenPiProcessor(openpi_recipe)
     images = {"wrist": torch.ones(3, 224, 224), "base": torch.zeros(3, 224, 224)}

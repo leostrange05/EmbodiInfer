@@ -34,6 +34,8 @@ step (never mutated), so there is no HF ``DynamicCache`` to defend against.
 from __future__ import annotations
 
 import functools
+import math
+import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -588,6 +590,11 @@ class Pi05Policy(FlowVLAPolicy):
             self._lerobot = checkpoint.eval()
         self.checkpoint = checkpoint if isinstance(checkpoint, str) else None
         self._m = self._lerobot.model  # PI05Pytorch: embeddings, projections, masks
+        # Configure the loaded Hugging Face vision backbone explicitly.
+        # EmbodiInfer's vision_attention alone controls its native path.
+        if vision_attention == "eager":
+            vision_tower = self._m.paligemma_with_expert.paligemma.model.vision_tower
+            vision_tower.set_attn_implementation("eager")
         pwe = self._m.paligemma_with_expert
         self._prefix_tower = pwe.paligemma.model.language_model  # PiGemmaModel (VLM text)
         self._expert_tower = pwe.gemma_expert.model  # PiGemmaModel (action expert)
@@ -1178,6 +1185,71 @@ class Pi05Policy(FlowVLAPolicy):
             self._cached_suffix_att = cached
         return cached[None, :]  # [1, suffix_len]; caller expands over batch
 
+    def _npu_fp32_time_embedding(
+        self,
+        t: torch.Tensor,
+        dimension: int,
+        *,
+        min_period: float,
+        max_period: float,
+    ) -> torch.Tensor:
+        """Compute the PI0.5 sinusoidal condition on NPU without float64 reciprocal."""
+        fraction = torch.linspace(
+            0.0,
+            1.0,
+            dimension // 2,
+            dtype=torch.float32,
+            device=t.device,
+        )
+        log_period = math.log(min_period) + fraction * math.log(
+            max_period / min_period
+        )
+        scaling_factor = (2.0 * math.pi) * torch.exp(-log_period)
+        sin_input = scaling_factor[None, :] * t[:, None]
+        return torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
+
+    def _time_embedding(
+        self,
+        t: torch.Tensor,
+        dimension: int,
+        *,
+        min_period: float,
+        max_period: float,
+    ) -> torch.Tensor:
+        """Create PI0.5's time condition with an Ascend-safe implementation.
+
+        CPU and CUDA retain LeRobot's exact reference implementation. NPU uses
+        the validated native FP32 implementation by default. Set
+        EMBODIINFER_ASCEND_CPU_TIME_EMBEDDING=1 only to force the reference
+        CPU fallback for diagnosis or recovery.
+        """
+        if t.device.type != "npu":
+            return self._sinusoidal(
+                t,
+                dimension,
+                min_period=min_period,
+                max_period=max_period,
+                device=t.device,
+            )
+
+        if os.environ.get("EMBODIINFER_ASCEND_CPU_TIME_EMBEDDING") != "1":
+            return self._npu_fp32_time_embedding(
+                t,
+                dimension,
+                min_period=min_period,
+                max_period=max_period,
+            ).to(dtype=t.dtype)
+
+        cpu_time = t.to("cpu", non_blocking=False)
+        embedding = self._sinusoidal(
+            cpu_time,
+            dimension,
+            min_period=min_period,
+            max_period=max_period,
+            device=torch.device("cpu"),
+        )
+        return embedding.to(dtype=t.dtype).to(t.device, non_blocking=False)
+
     def _embed_suffix(
         self, x_t: torch.Tensor, t: torch.Tensor, *, skip_time: bool = False, skip_mask: bool = False
     ):
@@ -1190,12 +1262,11 @@ class Pi05Policy(FlowVLAPolicy):
         action_emb = m.action_in_proj(x_t)
         adarms_cond = None
         if not skip_time:
-            time_emb = self._sinusoidal(
+            time_emb = self._time_embedding(
                 t,
                 m.action_in_proj.out_features,
                 min_period=m.config.min_period,
                 max_period=m.config.max_period,
-                device=t.device,
             ).type(dtype=t.dtype)
             h = m.time_mlp_in(time_emb)
             h = F.silu(h)
@@ -1211,12 +1282,11 @@ class Pi05Policy(FlowVLAPolicy):
 
     def _time_condition(self, t: torch.Tensor) -> torch.Tensor:
         m = self._m
-        embedding = self._sinusoidal(
+        embedding = self._time_embedding(
             t,
             m.action_in_proj.out_features,
             min_period=m.config.min_period,
             max_period=m.config.max_period,
-            device=t.device,
         ).to(t.dtype)
         return F.silu(m.time_mlp_out(F.silu(m.time_mlp_in(embedding))))
 

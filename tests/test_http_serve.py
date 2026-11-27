@@ -227,3 +227,19 @@ def test_rejected_body_closes_connection(path, headers, token, status) -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_json_response_tolerates_disconnected_client() -> None:
+    class BrokenWriter:
+        def write(self, _raw: bytes) -> None:
+            raise BrokenPipeError
+
+    handler = object.__new__(PolicyHttpHandler)
+    handler.close_connection = False
+    handler.send_response = lambda _code: None
+    handler.send_header = lambda _name, _value: None
+    handler.end_headers = lambda: None
+    handler.wfile = BrokenWriter()
+
+    handler._write_json(200, {"ok": True})
+    assert handler.close_connection is True

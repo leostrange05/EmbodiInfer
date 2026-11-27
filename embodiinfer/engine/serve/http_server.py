@@ -153,13 +153,19 @@ class PolicyHttpHandler(BaseHTTPRequestHandler):
 
     def _write_json(self, code: int, payload: Mapping[str, Any]) -> None:
         raw = _json(payload)
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        if self.close_connection:
-            self.send_header("Connection", "close")
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            if self.close_connection:
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionResetError):
+            # Long first requests may outlive a caller's timeout. A disconnected
+            # peer is not a policy or serving failure, and a second error response
+            # cannot be delivered either.
+            self.close_connection = True
 
     def _write_error(self, error: ServeError) -> None:
         # Rejected requests may still have unread body bytes on the connection.
@@ -288,7 +294,8 @@ def main(argv: list[str] | None = None) -> None:
     server.service = service  # dynamic attribute used by the request handler
     print(
         f"[vvla-http] policy={args.policy} device={args.device} "
-        f"action_space={service.action_space} listen={args.host}:{args.port}"
+        f"action_space={service.action_space} listen={args.host}:{args.port}",
+        flush=True,
     )
     try:
         server.serve_forever()
